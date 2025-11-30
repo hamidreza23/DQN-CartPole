@@ -98,10 +98,17 @@ def train_step(
     q_values = online_net(states_t)                  # [B, action_dim]
     q_sa = q_values.gather(1, actions_t)             # [B,1]
 
-    # Compute target: r + γ * max_a' Q_target(s', a') * (1 - done)
+    # Double DQN target computation
     with torch.no_grad():
-        next_q_values = target_net(next_states_t)    # [B, action_dim]
-        max_next_q = next_q_values.max(dim=1, keepdim=True)[0]  # [B,1]
+        # 1) Use online net to choose best actions in next_states
+        next_q_online = online_net(next_states_t)                     # [B, action_dim]
+        best_next_actions = next_q_online.argmax(dim=1, keepdim=True)  # [B,1]
+
+        # 2) Use target net to evaluate those actions
+        next_q_target = target_net(next_states_t)                    # [B, action_dim]
+        max_next_q = next_q_target.gather(1, best_next_actions)      # [B,1]
+
+        # 3) Double DQN target
         target = rewards_t + gamma * max_next_q * (1.0 - dones_t)
 
     # Loss = MSE(target, q_sa)
@@ -150,6 +157,32 @@ def step_env(env, action):
         return next_state, reward, done, terminated, truncated, info
 
 
+def evaluate_policy(env, online_net, device, n_episodes: int = 5) -> float:
+    """Run policy with epsilon=0 (greedy) for n_episodes and return average reward."""
+    online_net.eval()
+    rewards = []
+
+    for _ in range(n_episodes):
+        state, _ = reset_env(env)
+        done = False
+        episode_reward = 0.0
+
+        while not done:
+            state_t = torch.tensor(state, dtype=torch.float32, device=device).unsqueeze(0)
+            with torch.no_grad():
+                q_values = online_net(state_t)
+            action = q_values.argmax(dim=1).item()
+
+            next_state, reward, done, terminated, truncated, info = step_env(env, action)
+            episode_reward += reward
+            state = next_state
+
+        rewards.append(episode_reward)
+
+    online_net.train()
+    return float(np.mean(rewards))
+
+
 def train_dqn(
     env_name="CartPole-v1",
     max_episodes=500,
@@ -167,6 +200,17 @@ def train_dqn(
     
     # Setup environment
     env = gym.make(env_name)
+    
+    # Set seeds for reproducibility
+    seed = 0
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    try:
+        env.reset(seed=seed)
+    except TypeError:
+        # older gym
+        env.seed(seed)
     
     # Setup device
     if device is None:
@@ -244,10 +288,22 @@ def train_dqn(
         avg_loss = np.mean(episode_losses) if episode_losses else 0.0
         avg_reward = np.mean(episode_rewards[-100:]) if len(episode_rewards) >= 100 else episode_reward
 
+        # Early stopping if solved
+        if len(episode_rewards) >= 100 and avg_reward >= 195.0:
+            print(f"Solved! Avg reward over last 100 episodes: {avg_reward:.2f}")
+            break
+
+        eval_reward = None
+        if (episode + 1) % 20 == 0:
+            eval_reward = evaluate_policy(env, online_net, device, n_episodes=5)
+
         if (episode + 1) % 10 == 0 or episode == 0:
-            print(f"Episode {episode+1:4d} | Reward: {episode_reward:6.1f} | "
-                  f"Avg Reward (last 100): {avg_reward:6.1f} | "
-                  f"Epsilon: {epsilon:.3f} | Loss: {avg_loss:.4f}")
+            msg = (f"Episode {episode+1:4d} | Reward: {episode_reward:6.1f} | "
+                   f"Avg Reward (last 100): {avg_reward:6.1f} | "
+                   f"Epsilon: {epsilon:.3f} | Loss: {avg_loss:.4f}")
+            if eval_reward is not None:
+                msg += f" | Eval Reward: {eval_reward:6.1f}"
+            print(msg)
 
     env.close()
     
